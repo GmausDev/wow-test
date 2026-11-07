@@ -1,0 +1,5 @@
+numpy
+soundcard>=0.4.3
+pydirectinput>=1.0.4
+pynput>=1.7
+mss>=9

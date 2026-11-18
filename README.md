@@ -11,8 +11,8 @@ It casts, finds the bobber on screen, waits for the splash of a bite, right-clic
 1. **Look:** takes a screenshot of the water just before casting.
 2. **Cast:** presses your Fishing key.
 3. **Find:** once the bobber lands, takes another screenshot and looks for the *new* red pixels (the bobber's feather). Comparing before and after means red things that were already on screen, like UI or nameplates, are ignored.
-4. **Listen:** watches your PC's audio output for the volume spike of a bite.
-5. **Reel in:** glides the mouse to the bobber and right-clicks. Auto Loot takes the catch.
+4. **Hover and listen:** glides the mouse onto the bobber and rests it there, while watching your PC's audio output for the volume spike of a bite.
+5. **Reel in:** right-clicks. Auto Loot takes the catch.
 
 It only reads the screen and the system audio, and sends ordinary key presses and mouse clicks. It doesn't read or change the game's memory or files. It only acts while WoW is the focused window, and pauses if you switch away.
 
@@ -68,6 +68,26 @@ python wow_fisher.py --threshold 0.08
 
 You get 5 seconds to click into WoW.
 
+**Buffs (lures, food, drinks)**
+
+For zones where you need extra fishing skill, `--buff KEY:MINUTES[:SECONDS]` presses a key on a timer. Repeat it for each buff:
+
+```powershell
+python wow_fisher.py --threshold 0.08 --buff 2:10:6 --buff 3:30:12
+```
+
+That presses `2` every 10 minutes and waits 6 s for it to finish (a lure), and `3` every 30 minutes with a 12 s wait (food). `MINUTES` is how long the buff lasts; `SECONDS` is how long your character is busy applying or eating it (default 6). Every buff is applied once at the start, then refreshed between casts, a little before it runs out.
+
+- **Lure:** in Classic a lure has to be used and then clicked onto the pole, so put a macro on the key (use your lure's name):
+  ```
+  /use Bright Baubles
+  /use 16
+  ```
+  If your client applies lures to the equipped pole by itself, the lure can go straight on the bar.
+- **Food / drink:** put the item on the bar. Set `SECONDS` to how long you must keep eating for the buff (about 10 s for Well Fed, plus a little), since the next cast makes you stand up.
+
+The script can't see your buffs or bags: it only presses the key on time. When you run out of lures or food it keeps fishing without them.
+
 **Stopping:** press `F12`, slam the mouse into the top-left corner of the screen, or press `Ctrl+C` in the console. It also stops by itself after 10 misses in a row (for example if you died, moved, or got disconnected), and after `--hours` if you set it.
 
 ## Options
@@ -79,9 +99,12 @@ You get 5 seconds to click into WoW.
 | `--cast-key` | `1` | Key bound to Fishing |
 | `--interact-key` | `f` | Interact With Target key (interact mode only) |
 | `--stop-key` | `f12` | Global stop key |
-| `--timeout` | `20` | Seconds to listen for a bite before recasting (a Classic cast lasts about 22 s) |
+| `--timeout` | `28` | Seconds to listen for a bite before recasting (a cast can last up to about 30 s) |
 | `--hours` | `0` | Stop after this many hours (0 = run until stopped) |
+| `--close-game` | off | Close WoW when the `--hours` limit is reached (needs `--hours`) |
+| `--buff` | none | `KEY:MINUTES[:SECONDS]`: press KEY every MINUTES to refresh a lure/food buff, then wait SECONDS (default 6). Repeatable |
 | `--max-misses` | `10` | Stop after this many misses in a row |
+| `--no-hover` | off | Don't rest the mouse on the bobber while waiting; move there only when a fish bites (slower) |
 | `--no-humanize` | off | Exact, fixed timings with no deliberate mistakes or breaks |
 | `--search-area` | `0.15,0.10,0.85,0.75` | Where to look for the bobber: left,top,right,bottom as fractions of the window |
 | `--red-min` | `100` | Minimum red value for the feather |
@@ -96,14 +119,16 @@ These are set in the `HUMAN` table at the top of `wow_fisher.py`:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `reaction` | 0.35–1.4 s, usually ~0.6 | Time from the splash to the click |
+| `reaction` | 0.25–0.9 s, usually ~0.4 | Time from the splash to the click |
 | `settle` | 2.3–3.2 s | Wait after casting before looking for the bobber |
-| `loot_wait` | 1.2–3.2 s | Pause between reeling in and the next cast |
+| `loot_wait` | 0.9–2.2 s | Pause between reeling in and the next cast |
 | `jitter_px` | 3 px (capped at 6) | Normal click offset from the bobber's centre |
 | `miss_chance` | 4% | Chance to ignore a bite and let the fish go |
 | `misclick_chance` | 2% | Chance to click 22–45 px next to the bobber |
 | `move_time` | 0.12–0.35 s | How long the mouse takes to glide to the bobber |
 | `break_every` / `break_length` | every 35–90 casts, for 20–150 s | Short breaks |
+| `buff_early` | 8–45 s | How long before a buff runs out it gets refreshed |
+| `buff_extra` | 0.4–1.8 s | Extra wait after a buff's own apply/eating time |
 
 ## Troubleshooting
 
@@ -127,5 +152,5 @@ These are set in the `HUMAN` table at the top of `wow_fisher.py`:
 
 ```bash
 cd tests
-python test_vision.py && python test_interact.py && python test_loop.py
+python test_vision.py && python test_interact.py && python test_loop.py && python test_buffs.py
 ```

@@ -5,8 +5,9 @@ How it works (default "mouse" mode)
   1. Takes a screenshot of the water, then presses your Fishing key to cast.
   2. Once the bobber lands, takes a second screenshot and finds the bobber by
      the new red feather that appeared.
-  3. Listens to your PC's audio output for the splash of a bite.
-  4. Right-clicks the bobber (Auto Loot takes the catch) and casts again.
+  3. Rests the mouse on the bobber and listens to your PC's audio output for
+     the splash of a bite.
+  4. Right-clicks (Auto Loot takes the catch) and casts again.
 
 It's deliberately imperfect: reaction times vary, the mouse glides rather than
 jumps, clicks land a few pixels off, it now and then lets a fish go or clicks
@@ -49,6 +50,13 @@ Step 2 - check it can see the bobber
 Step 3 - fish
   python wow_fisher.py --threshold 0.08
   You get 5 seconds to click into WoW.
+
+Buffs (lures, food, drinks)
+  python wow_fisher.py --buff 2:10:6 --buff 3:30:12
+  Presses key 2 every 10 minutes and waits 6 s for it to finish (a lure),
+  and key 3 every 30 minutes with a 12 s wait (food). Each key is pressed
+  between casts, a little before the buff runs out. See the README for the
+  lure macro.
 ------------------------------------------------------------------------------
 """
 
@@ -84,9 +92,9 @@ stop_event = threading.Event()
 # now and then clicks next to the bobber, and it takes breaks.
 # Tweak these to taste, or turn it all off with --no-humanize.
 HUMAN = {
-    "reaction": (0.35, 1.4, 0.6),    # seconds from splash to click: triangular(min, max, most likely)
+    "reaction": (0.25, 0.9, 0.4),    # seconds from splash to click: triangular(min, max, most likely)
     "settle": (2.3, 3.2),            # seconds after casting before looking for the bobber
-    "loot_wait": (1.2, 3.2),         # seconds between reeling in and the next cast
+    "loot_wait": (0.9, 2.2),         # seconds between reeling in and the next cast
     "jitter_px": 3,                  # typical click offset from the bobber centre (capped at 2x), in pixels
     "miss_chance": 0.04,             # chance to ignore a bite and let the fish get away
     "misclick_chance": 0.02,         # chance to click clearly next to the bobber
@@ -94,6 +102,8 @@ HUMAN = {
     "move_time": (0.12, 0.35),       # seconds the mouse takes to glide to the bobber
     "break_every": (35, 90),         # casts between breaks (random in this range)
     "break_length": (20, 150),       # break length in seconds
+    "buff_early": (8, 45),           # seconds before a buff runs out that it gets refreshed
+    "buff_extra": (0.4, 1.8),        # extra seconds waited after a buff's own cast/eating time
 }
 
 
@@ -132,6 +142,12 @@ class Human:
         clamp = lambda v: int(max(-2 * j, min(2 * j, v)))  # stay on the bobber
         return clamp(random.gauss(0, j)), clamp(random.gauss(0, j)), False
 
+    def buff_early(self):
+        return random.uniform(*HUMAN["buff_early"]) if self.enabled else 10.0
+
+    def buff_extra(self):
+        return random.uniform(*HUMAN["buff_extra"]) if self.enabled else 0.5
+
     def break_due(self):
         """Call once per cast. Returns a break length in seconds when one is due, else 0."""
         if not self.enabled:
@@ -141,6 +157,41 @@ class Human:
             return 0
         self.casts_until_break = self._next_break()
         return random.uniform(*HUMAN["break_length"])
+
+
+# --------------------------------------------------------------------------- buffs
+
+class Buff:
+    """A key to press every so often: a lure macro, food, a drink..."""
+
+    def __init__(self, key, minutes, busy):
+        self.label = key           # as typed, for messages
+        self.key = key             # what gets pressed (translated for the keyboard layout in main)
+        self.duration = minutes * 60
+        self.busy = busy           # seconds the character is tied up applying/eating
+        self.due = 0.0             # time.monotonic() at which to press it next; 0 = right away
+
+    def is_due(self):
+        return time.monotonic() >= self.due
+
+    def applied(self, early):
+        # never schedule the refresh more than half the duration early
+        self.due = time.monotonic() + self.duration - min(early, self.duration / 2)
+
+
+def parse_buff(text):
+    parts = text.split(":")
+    try:
+        if len(parts) not in (2, 3) or not parts[0]:
+            raise ValueError
+        minutes = float(parts[1])
+        busy = float(parts[2]) if len(parts) == 3 else 6.0
+        if minutes <= 0 or busy < 0:
+            raise ValueError
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "use KEY:MINUTES or KEY:MINUTES:SECONDS, e.g. 2:10:6 (key 2, lasts 10 min, takes 6 s to apply)")
+    return Buff(parts[0], minutes, busy)
 
 
 # --------------------------------------------------------------------------- windows / input
@@ -192,6 +243,75 @@ def wow_client_rect():
     return origin.x, origin.y, rect.right, rect.bottom
 
 
+def layout_key(key):
+    """pydirectinput names keys by their position on a US keyboard. Translate a
+    character to the name of the physical key that types it on the current
+    layout (e.g. ' on a Spanish keyboard sits where US has -)."""
+    if len(key) != 1:
+        return key
+    try:
+        user32 = ctypes.WinDLL("user32")  # private handle: pynput sets argtypes on the shared one
+        user32.VkKeyScanW.restype = ctypes.c_short
+        vk = user32.VkKeyScanW(ord(key))
+        if vk == -1 or vk >> 8:  # not on this layout, or needs Shift/AltGr
+            return key
+        scan = user32.MapVirtualKeyW(vk & 0xFF, 0)
+        for name, code in pydirectinput.KEYBOARD_MAPPING.items():
+            if code == scan and len(name) == 1:
+                return name
+    except Exception:
+        pass
+    return key
+
+
+def close_wow():
+    """Ask the WoW client to quit, like clicking the window's X. Returns True once it's gone."""
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32")
+    kernel32 = ctypes.WinDLL("kernel32")
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                    ctypes.POINTER(wintypes.DWORD)]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    found = []
+
+    def exe_name(hwnd):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ""
+        buf, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+        ok = kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+        kernel32.CloseHandle(handle)
+        return buf.value.replace("/", "\\").rsplit("\\", 1)[-1].lower() if ok else ""
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(hwnd, _):
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+        # the title alone could be a browser tab, so the program must be Wow*.exe too
+        if (user32.IsWindowVisible(hwnd) and buf.value.strip().startswith("World of Warcraft")
+                and exe_name(hwnd).startswith("wow")):
+            found.append(hwnd)
+        return True
+
+    user32.EnumWindows(each, 0)
+    if not found:
+        return False
+    for hwnd in found:
+        user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+    end = time.monotonic() + 20
+    while time.monotonic() < end:
+        if not any(user32.IsWindow(h) for h in found):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def press(key):
     """Press a key, but only if WoW has focus. Returns True if pressed."""
     if not wow_focused():
@@ -207,6 +327,8 @@ def glide_to(x, y, human):
         return
     sx, sy = pydirectinput.position()
     dx, dy = x - sx, y - sy
+    if abs(dx) <= 1 and abs(dy) <= 1:
+        return  # already there (the mouse was resting on the bobber)
     bend = random.uniform(-0.25, 0.25)
     cx, cy = sx + dx / 2 - dy * bend, sy + dy / 2 + dx * bend  # control point off to one side
     steps = random.randint(8, 16)
@@ -220,17 +342,23 @@ def glide_to(x, y, human):
         time.sleep(pause)
 
 
-def reel_in(args, target, human):
-    """Right-click the bobber (mouse mode) or press Interact. Only if WoW has focus.
+def pick_aim(target, human):
+    """Where this cast's click will land: (x, y, is_misclick)."""
+    ox, oy, misclick = human.click_offset()
+    return target[0] + ox, target[1] + oy, misclick
+
+
+def reel_in(args, aim, human):
+    """Right-click at the aim point (mouse mode) or press Interact. Only if WoW has focus.
     Returns None if WoW wasn't focused, otherwise True for a normal click, False for a misclick."""
     if not wow_focused():
         return None
-    if target is None:
+    if aim is None:
         pydirectinput.press(args.interact_key)
         return True
-    ox, oy, misclick = human.click_offset()
-    glide_to(target[0] + ox, target[1] + oy, human)
-    time.sleep(random.uniform(0.05, 0.15) if human.enabled else 0.1)
+    x, y, misclick = aim
+    glide_to(x, y, human)  # no move at all when the mouse is already resting there
+    time.sleep(random.uniform(0.03, 0.09) if human.enabled else 0.03)
     pydirectinput.rightClick()
     return not misclick
 
@@ -398,12 +526,16 @@ def test_bobber(args):
 def fish(args):
     human = Human(not args.no_humanize, args)
     casts = catches = no_bite = not_found = let_go = misclicks = breaks = consecutive_misses = 0
+    buffs_applied = 0
     started = time.monotonic()
+    timed_out = False
     deadline = started + args.hours * 3600 if args.hours else None
 
     how = "right-clicking the bobber" if args.mode == "mouse" else f"pressing interact key '{args.interact_key}'"
     print(f"Fishing with cast key '{args.cast_key}', reeling in by {how}, threshold {args.threshold}.")
     print(f"Human-like variation: {'on' if human.enabled else 'off'}.")
+    for b in args.buff:
+        print(f"Buff key '{b.label}': every {b.duration / 60:g} min, {b.busy:g}s to apply.")
     print(f"Stop: {args.stop_key.upper()}, mouse to top-left corner, or Ctrl+C.")
     countdown(args.start_delay)
 
@@ -421,6 +553,7 @@ def fish(args):
         while not stop_event.is_set():
             if deadline and time.monotonic() >= deadline:
                 status(f"Reached the {args.hours} h limit.")
+                timed_out = True
                 break
 
             if not wow_focused():
@@ -438,6 +571,18 @@ def fish(args):
                 if stop_event.is_set():
                     break
 
+            # Refresh lures/food between casts, before the "before" screenshot.
+            for b in args.buff:
+                if stop_event.is_set():
+                    break
+                if b.is_due() and press(b.key):
+                    buffs_applied += 1
+                    b.applied(human.buff_early())
+                    status(f"Buff key '{b.label}' pressed - waiting {b.busy:g}s for it to finish.")
+                    wait(rec, b.busy + human.buff_extra())
+            if stop_event.is_set():
+                break
+
             if args.mode == "mouse":
                 region = search_region(args)
                 before = grab(sct, region)
@@ -448,7 +593,7 @@ def fish(args):
             # Let the cast play out and the bobber land before looking/listening.
             wait(rec, human.settle())
 
-            target = None
+            aim = None
             if args.mode == "mouse":
                 found = find_bobber(before, grab(sct, region), args)
                 if not found:
@@ -456,7 +601,11 @@ def fish(args):
                     if missed("Couldn't spot the bobber - recasting. (Try --test-bobber.)"):
                         break
                     continue
-                target = (region["left"] + found[0], region["top"] + found[1])
+                aim = pick_aim((region["left"] + found[0], region["top"] + found[1]), human)
+                # Rest the mouse on the bobber while waiting, so a bite only needs a click.
+                # (A deliberate misclick moves at bite time instead.)
+                if not args.no_hover and not aim[2] and wow_focused():
+                    glide_to(aim[0], aim[1], human)
 
             bite = listen_for_bite(rec, args)
             if stop_event.is_set():
@@ -469,7 +618,7 @@ def fish(args):
                     wait(rec, random.uniform(1.5, 4.0))
                     continue
                 wait(rec, human.reaction())
-                result = reel_in(args, target, human)
+                result = reel_in(args, aim, human)
                 if result is None:
                     status("Heard a bite, but WoW wasn't focused - skipped it.")
                 elif result:
@@ -488,7 +637,12 @@ def fish(args):
 
     mins = (time.monotonic() - started) / 60
     print(f"\nDone after {mins:.1f} min: {casts} casts, {catches} reeled in, {no_bite} with no bite heard, "
-          f"{not_found} bobber not found, {let_go} let go and {misclicks} misclicked on purpose, {breaks} breaks.")
+          f"{not_found} bobber not found, {let_go} let go and {misclicks} misclicked on purpose, {breaks} breaks, "
+          f"{buffs_applied} buff key presses.")
+
+    if args.close_game and timed_out:
+        status("Closing WoW (--close-game).")
+        status("WoW closed." if close_wow() else "Couldn't close WoW - it may still be running.")
 
 
 # --------------------------------------------------------------------------- entry point
@@ -511,13 +665,20 @@ def build_parser():
     p.add_argument("--interact-key", default="f", help="Interact With Target key, for --mode interact (default f)")
     p.add_argument("--stop-key", default="f12", help="global key that stops the script (default f12)")
     p.add_argument("--no-humanize", action="store_true", help="turn off the human-like variation (exact, fixed timings)")
+    p.add_argument("--no-hover", action="store_true",
+                   help="don't rest the mouse on the bobber while waiting; move there only when a fish bites")
     p.add_argument("--settle", type=float, default=2.5,
                    help="seconds after casting before looking/listening, with --no-humanize and --test-bobber (default 2.5)")
-    p.add_argument("--timeout", type=float, default=20.0, help="seconds to listen for a bite before recasting (default 20)")
-    p.add_argument("--reaction", type=float, default=0.4, help="delay from bite to reel-in, with --no-humanize (default 0.4)")
-    p.add_argument("--loot-wait", type=float, default=2.0, help="wait after reeling in, with --no-humanize (default 2)")
+    p.add_argument("--timeout", type=float, default=28.0, help="seconds to listen for a bite before recasting (default 28)")
+    p.add_argument("--reaction", type=float, default=0.25, help="delay from bite to reel-in, with --no-humanize (default 0.25)")
+    p.add_argument("--loot-wait", type=float, default=1.5, help="wait after reeling in, with --no-humanize (default 1.5)")
     p.add_argument("--max-misses", type=int, default=10, help="stop after this many misses in a row (default 10)")
     p.add_argument("--hours", type=float, default=0, help="stop after this many hours (default 0 = run until stopped)")
+    p.add_argument("--close-game", action="store_true",
+                   help="close WoW when the --hours limit is reached (needs --hours)")
+    p.add_argument("--buff", type=parse_buff, action="append", default=[], metavar="KEY:MINUTES[:SECONDS]",
+                   help="press KEY every MINUTES to refresh a buff (lure macro, food...), then wait SECONDS "
+                        "(default 6) for it to finish. Repeat for several buffs, e.g. --buff 2:10:6 --buff 3:30:12")
     p.add_argument("--start-delay", type=int, default=5, help="countdown before starting (default 5)")
     p.add_argument("--search-area", type=parse_area, default=[0.15, 0.10, 0.85, 0.75],
                    help="where to look for the bobber: left,top,right,bottom as window fractions")
@@ -528,11 +689,18 @@ def build_parser():
 
 
 def main():
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.close_game and not args.hours:
+        parser.error("--close-game needs --hours: the game is closed when that time is up")
     if sys.platform != "win32":
         sys.exit("This script needs Windows.")
 
     make_dpi_aware()
+    args.cast_key = layout_key(args.cast_key)
+    args.interact_key = layout_key(args.interact_key)
+    for b in args.buff:
+        b.key = layout_key(b.key)
     start_stop_key_listener(args.stop_key)
     try:
         if args.calibrate:
